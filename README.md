@@ -3,7 +3,7 @@
 A fully free AI chat app powered by Google Gemini. No subscription. No credit card.
 
 ## Features
-- 💬 Chat with Gemini 2.0 Flash, 1.5 Flash, or 1.5 Pro
+- 💬 Chat with the latest Gemini models (the list updates automatically from your API key)
 - 📎 Upload images, PDFs, DOCX, CSV, TXT, JSON, ZIP, and more
 - 🗂️ Conversation history (saved in your browser)
 - 📤 Export chats as text files
