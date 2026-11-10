@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<link rel="preconnect" href="https://generativelanguage.googleapis.com">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>AskAI – Free AI Assistant</title>
@@ -914,6 +915,7 @@ const DEFAULT_MODEL = 'gemini-3.8-flash';
 // "-latest" aliases are maintained by Google and never go stale
 const FALLBACK_MODELS = [
   { id: 'gemini-3.8-flash', name: 'Gemini 3.8 Flash', desc: 'Fast · Free · Multimodal' },
+  { id: 'gemini-flash-lite-latest', name: '⚡ Gemini Flash-Lite (fastest)', desc: 'Fastest · Lightweight' },
   { id: 'gemini-flash-latest', name: 'Gemini Flash (latest)', desc: 'Always the newest Flash' },
   { id: 'gemini-pro-latest', name: 'Gemini Pro (latest)', desc: 'Always the newest Pro' }
 ];
@@ -925,6 +927,8 @@ let conversations = JSON.parse(localStorage.getItem('askai_convos') || '[]');
 let currentConvoId = null;
 let pendingFiles = []; // { name, type, base64, mimeType, isImage, objectUrl }
 let isStreaming = false;
+const THINKING_LEVELS = ['minimal', 'low', null]; // fastest first; falls back if a model rejects it
+let thinkingIdx = 0;
 
 // ── Init ──
 window.onload = () => {
@@ -983,6 +987,9 @@ async function refreshModels() {
       name: m.display || modelDisplayName(m.id),
       desc: /pro/.test(m.id) ? 'Powerful · Best quality' : /lite/.test(m.id) ? 'Fastest · Lightweight' : 'Fast · Multimodal'
     }));
+    if (!availableModels.some(m => m.id === 'gemini-flash-lite-latest')) {
+      availableModels.unshift({ id: 'gemini-flash-lite-latest', name: '⚡ Gemini Flash-Lite (fastest)', desc: 'Fastest · Lightweight' });
+    }
     if (!availableModels.some(m => m.id === selectedModel)) {
       const pick = availableModels.find(m => /flash/.test(m.id) && !/lite/.test(m.id)) || availableModels[0];
       selectedModel = pick.id;
@@ -1230,9 +1237,17 @@ async function sendMessage() {
   isStreaming = true;
 
   try {
-    const reply = await callGemini(convo.messages, files);
+    let bubbleEl = null;
+    let latest = '', scheduled = false;
+    const reply = await callGemini(convo.messages, files, partial => {
+      latest = partial;
+      if (!bubbleEl) { typingEl.remove(); bubbleEl = appendAIBubble(''); }
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => { scheduled = false; updateAIBubble(bubbleEl, latest); scrollBottom(); });
+    });
     typingEl.remove();
-    appendAIBubble(reply);
+    if (bubbleEl) updateAIBubble(bubbleEl, reply); else appendAIBubble(reply);
     convo.messages.push({ role: 'assistant', text: reply });
     saveConversations();
   } catch (err) {
@@ -1245,9 +1260,14 @@ async function sendMessage() {
   scrollBottom();
 }
 
+// ── Status text shown while waiting ──
+function setStatus(text) {
+  const t = document.querySelector('.typing-status');
+  if (t) t.textContent = text;
+}
+
 // ── Gemini API call ──
-async function callGemini(messages, currentFiles) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${apiKey}`;
+async function callGemini(messages, currentFiles, onChunk) {
 
   // Build parts for the latest user message
   const lastMsg = messages[messages.length - 1];
@@ -1278,7 +1298,8 @@ async function callGemini(messages, currentFiles) {
   const contents = [];
 
   // Previous messages (without files for simplicity)
-  for (let i = 0; i < messages.length - 1; i++) {
+  const startIdx = Math.max(0, messages.length - 1 - 12); // only send recent history: smaller = faster
+  for (let i = startIdx; i < messages.length - 1; i++) {
     const m = messages[i];
     const role = m.role === 'user' ? 'user' : 'model';
     contents.push({ role, parts: [{ text: m.text || '' }] });
@@ -1287,23 +1308,69 @@ async function callGemini(messages, currentFiles) {
   // Current message with files
   contents.push({ role: 'user', parts });
 
-  const body = {
+  const makeBody = () => ({
     contents,
-    generationConfig: {
+    generationConfig: Object.assign({
       temperature: 0.7,
       maxOutputTokens: 8192,
-    }
-  };
-
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    }, THINKING_LEVELS[thinkingIdx] ? { thinkingConfig: { thinkingLevel: THINKING_LEVELS[thinkingIdx] } } : {})
   });
 
+  // Try the selected model first, then a few others if it is busy or too slow
+  const candidates = [selectedModel];
+  const extras = ['gemini-flash-latest', 'gemini-flash-lite-latest'].concat(availableModels.map(m => m.id));
+  extras.forEach(id => { if (!candidates.includes(id)) candidates.push(id); });
+
+  const isBusy = (status, msg) => [429, 500, 503, 504].includes(status) || /high demand|overloaded|try again later|unavailable/i.test(msg || '');
+  const FIRST_BYTE_MS = 25000;  // give up on a model that does not start answering
+  const IDLE_MS = 30000;        // give up if a stream goes silent
+
+  let res = null, usedModel = null;
+  for (let ci = 0; ci < Math.min(candidates.length, 3); ci++) {
+    const model = candidates[ci];
+    setStatus(ci === 0 ? 'Thinking…' : 'Trying ' + modelDisplayName(model) + '…');
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+
+    // Up to 3 tries per model: steps down the thinking level if the model rejects it
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), FIRST_BYTE_MS);
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(makeBody()),
+          signal: ctrl.signal
+        });
+      } catch (netErr) {
+        clearTimeout(timer);
+        if (netErr.name === 'AbortError') { res = { ok: false, status: 504, timedOut: true, json: async () => ({}) }; break; }
+        throw new Error('Network error. Check your internet connection and try again.');
+      }
+      clearTimeout(timer);
+      if (res.ok) break;
+      const errBody = await res.clone().json().catch(() => ({}));
+      const errMsg = errBody?.error?.message || res.statusText;
+      if (res.status === 400 && thinkingIdx < THINKING_LEVELS.length - 1 && /thinking/i.test(errMsg)) {
+        thinkingIdx++; // model rejected this level: try the next one
+        continue;
+      }
+      break;
+    }
+    if (res.ok) { usedModel = model; break; }
+    const e = await res.clone().json().catch(() => ({}));
+    const m = e?.error?.message || res.statusText;
+    if (res.timedOut || res.status === 404 || isBusy(res.status, m)) continue; // try next model
+    break; // real error (bad key, bad request...)
+  }
+
   if (!res.ok) {
+    setStatus('');
     const err = await res.json().catch(() => ({}));
     const msg = err?.error?.message || res.statusText;
+    if (res.timedOut || [429, 500, 503, 504].includes(res.status) || /high demand|overloaded/i.test(msg)) {
+      throw new Error('Google\'s servers are very busy right now (I tried several models). Please wait a minute and send your message again.');
+    }
     if (res.status === 404 || /no longer available|not found/i.test(msg)) {
       refreshModels();
       throw new Error('That model is unavailable. I refreshed the model list - please pick a model from the dropdown and try again. ' + msg);
@@ -1313,12 +1380,44 @@ async function callGemini(messages, currentFiles) {
     throw new Error(msg);
   }
 
-  const data = await res.json();
-  const text = (data?.candidates?.[0]?.content?.parts || [])
-    .filter(p => p.text && !p.thought)
-    .map(p => p.text).join('');
-  if (!text) throw new Error('No response received from Gemini.');
-  return text;
+  if (usedModel !== selectedModel) showToast('Used ' + modelDisplayName(usedModel) + ' (' + modelDisplayName(selectedModel) + ' was busy)');
+
+  // ── Read the streamed answer and show it as it arrives ──
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', full = '';
+  const handleLine = line => {
+    line = line.trim();
+    if (!line.startsWith('data:')) return;
+    const json = line.slice(5).trim();
+    if (!json || json === '[DONE]') return;
+    try {
+      const chunk = JSON.parse(json);
+      const parts = chunk?.candidates?.[0]?.content?.parts || [];
+      const add = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
+      if (add) { full += add; if (onChunk) onChunk(full); }
+    } catch (e) { /* ignore partial JSON */ }
+  };
+
+  while (true) {
+    let idleTimer;
+    const result = await Promise.race([
+      reader.read(),
+      new Promise((_, rej) => { idleTimer = setTimeout(() => rej(new Error('idle')), IDLE_MS); })
+    ]).catch(err => { if (err.message === 'idle') return { done: true, idle: true }; throw err; });
+    clearTimeout(idleTimer);
+    if (result.done) break;
+    buffer += decoder.decode(result.value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    lines.forEach(handleLine);
+  }
+  if (buffer) handleLine(buffer);
+  reader.cancel().catch(() => {});
+
+  setStatus('');
+  if (!full) throw new Error('No response received from Gemini.');
+  return full;
 }
 
 // ── UI helpers ──
@@ -1358,6 +1457,11 @@ function appendAIBubble(text) {
   return div;
 }
 
+function updateAIBubble(div, text) {
+  const bubble = div.querySelector('.bubble');
+  bubble.innerHTML = `<button class="copy-btn" onclick="copyText(this)">Copy</button>${renderMarkdown(text)}`;
+}
+
 function appendTyping() {
   const msgs = document.getElementById('messages');
   const div = document.createElement('div');
@@ -1366,6 +1470,7 @@ function appendTyping() {
     <div class="avatar ai">✦</div>
     <div class="bubble">
       <div class="typing-dots"><span></span><span></span><span></span></div>
+      <div class="typing-status" style="font-size:12px;color:var(--text3);margin-top:6px;"></div>
     </div>`;
   msgs.appendChild(div);
   return div;
